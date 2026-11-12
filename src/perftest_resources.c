@@ -28,6 +28,7 @@
 
 #include "perftest_resources.h"
 #include "raw_ethernet_resources.h"
+#include "metax_memory.h"
 
 static enum ibv_wr_opcode opcode_verbs_array[] = {IBV_WR_SEND,IBV_WR_RDMA_WRITE,IBV_WR_RDMA_READ};
 static enum ibv_wr_opcode opcode_atomic_array[] = {IBV_WR_ATOMIC_CMP_AND_SWP,IBV_WR_ATOMIC_FETCH_AND_ADD};
@@ -1508,6 +1509,17 @@ int destroy_ctx(struct pingpong_context *ctx,
 		}
 	}
 
+	if (user_param->use_metax) {
+		for (i = 0; i < dereg_counter; i++) {
+			if (metax_memory_free(ctx->buf[i],
+					      user_param->metax_device_id)) {
+				fprintf(stderr, "Failed to free MetaX buffer #%d: %s\n",
+					i + 1, metax_memory_error());
+				test_result = 1;
+			}
+		}
+	}
+	else
 	#ifdef HAVE_CUDA
 	if (user_param->use_cuda) {
 		for (i = 0; i < dereg_counter; i++) {
@@ -1745,6 +1757,18 @@ int create_single_mr(struct pingpong_context *ctx, struct perftest_parameters *u
 	#endif
 
 
+	if (user_param->use_metax) {
+		ctx->is_contig_supported = FAILURE;
+		if (metax_memory_alloc(&ctx->buf[qp_index], ctx->buff_size,
+				       user_param->metax_device_id)) {
+			fprintf(stderr, "Couldn't allocate MetaX GPU buffer: %s\n",
+				metax_memory_error());
+			return FAILURE;
+		}
+		fprintf(stderr, "MetaX GPU buffer allocated: addr=%p length=%zu device=%d\n",
+			ctx->buf[qp_index], ctx->buff_size,
+			user_param->metax_device_id);
+	} else
 	#ifdef HAVE_CUDA
 	if (user_param->use_cuda) {
 		CUdeviceptr d_A;
@@ -1848,10 +1872,20 @@ int create_single_mr(struct pingpong_context *ctx, struct perftest_parameters *u
 #endif
 
 	/* Allocating Memory region and assigning our buffer to it. */
-	ctx->mr[qp_index] = ibv_reg_mr(ctx->pd, ctx->buf[qp_index], ctx->buff_size, flags);
+	if (user_param->use_metax)
+		ctx->mr[qp_index] = metax_memory_register(ctx->pd,
+			ctx->buf[qp_index], ctx->buff_size, flags);
+	else
+		ctx->mr[qp_index] = ibv_reg_mr(ctx->pd, ctx->buf[qp_index],
+			ctx->buff_size, flags);
 
 	if (!ctx->mr[qp_index]) {
-		fprintf(stderr, "Couldn't allocate MR\n");
+		fprintf(stderr, "Couldn't allocate MR%s%s\n",
+			user_param->use_metax ? ": " : "",
+			user_param->use_metax ? metax_memory_error() : "");
+		if (user_param->use_metax)
+			metax_memory_free(ctx->buf[qp_index],
+					  user_param->metax_device_id);
 		return FAILURE;
 	}
 
@@ -1860,6 +1894,21 @@ int create_single_mr(struct pingpong_context *ctx, struct perftest_parameters *u
 
 
 	/* Initialize buffer with random numbers except in WRITE_LAT test that it 0's */
+	if (user_param->use_metax) {
+		if (metax_memory_init_buffer(ctx->buf[qp_index], ctx->buff_size,
+					     user_param->metax_device_id,
+					     user_param->verb == WRITE &&
+					     user_param->tst == LAT)) {
+			fprintf(stderr, "Couldn't initialize MetaX GPU buffer: %s\n",
+				metax_memory_error());
+			ibv_dereg_mr(ctx->mr[qp_index]);
+			ctx->mr[qp_index] = NULL;
+			metax_memory_free(ctx->buf[qp_index],
+					  user_param->metax_device_id);
+			return FAILURE;
+		}
+		return SUCCESS;
+	}
 #ifdef HAVE_CUDA
 	if (!user_param->use_cuda) {
 #endif
@@ -4532,7 +4581,7 @@ int run_iter_lat_write(struct pingpong_context *ctx,struct perftest_parameters *
 	ctx->wr[0].sg_list->length = user_param->size;
 	ctx->wr[0].send_flags = IBV_SEND_SIGNALED;
 
-	if (user_param->size <= user_param->inline_size) {
+	if (!user_param->use_metax && user_param->size <= user_param->inline_size) {
 		ctx->wr[0].send_flags |= IBV_SEND_INLINE;
 	}
 
@@ -4561,7 +4610,22 @@ int run_iter_lat_write(struct pingpong_context *ctx,struct perftest_parameters *
 
 		if ((rcnt < user_param->iters || user_param->test_type == DURATION) && !(scnt < 1 && user_param->machine == SERVER)) {
 			rcnt++;
-			while (*poll_buf != (char)rcnt && user_param->state != END_STATE);
+			if (user_param->use_metax) {
+				unsigned char value = 0;
+				do {
+					if (metax_memory_read_byte((const void *)poll_buf,
+								   &value,
+								   user_param->metax_device_id)) {
+						fprintf(stderr, "MetaX latency poll failed: %s\n",
+							metax_memory_error());
+						return FAILURE;
+					}
+				} while (value != (unsigned char)rcnt &&
+					 user_param->state != END_STATE);
+			} else {
+				while (*poll_buf != (char)rcnt &&
+				       user_param->state != END_STATE);
+			}
 		}
 
 		if (scnt < user_param->iters || user_param->test_type == DURATION) {
@@ -4577,7 +4641,18 @@ int run_iter_lat_write(struct pingpong_context *ctx,struct perftest_parameters *
 			if (user_param->test_type == ITERATIONS)
 				user_param->tposted[scnt] = get_cycles();
 
-			*post_buf = (char)++scnt;
+			++scnt;
+			if (user_param->use_metax) {
+				if (metax_memory_write_byte((void *)post_buf,
+							    (unsigned char)scnt,
+							    user_param->metax_device_id)) {
+					fprintf(stderr, "MetaX latency marker update failed: %s\n",
+						metax_memory_error());
+					return FAILURE;
+				}
+			} else {
+				*post_buf = (char)scnt;
+			}
 
 			err = post_send_method(ctx, 0, user_param);
 

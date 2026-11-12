@@ -190,9 +190,12 @@ if [test $HAVE_SNIFFER = yes]; then
 fi
 
 if [test $IS_FREEBSD = no]; then
-	AC_CHECK_HEADERS([pci/pci.h],,[AC_MSG_ERROR([pciutils header files not found, consider installing pciutils-devel])])
-	AC_CHECK_LIB([pci], [pci_init], [LIBPCI=-lpci], AC_MSG_ERROR([libpci not found]))
-	CPU_IS_RO_COMPLIANT=yes
+	AC_CHECK_HEADERS([pci/pci.h],[HAVE_PCIUTILS=yes],[HAVE_PCIUTILS=no])
+	if [test $HAVE_PCIUTILS = yes]; then
+		AC_CHECK_LIB([pci], [pci_init], [LIBPCI=-lpci; CPU_IS_RO_COMPLIANT=yes], [CPU_IS_RO_COMPLIANT=no])
+	else
+		CPU_IS_RO_COMPLIANT=no
+	fi
 fi
 
 AC_TRY_LINK([

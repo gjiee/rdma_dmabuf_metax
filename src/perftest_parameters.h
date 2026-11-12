@@ -500,6 +500,8 @@ struct perftest_parameters {
 	int				buff_size;
 	int             		pkey_index;
 	int				raw_qos;
+	int				use_metax;
+	int				metax_device_id;
 #ifdef HAVE_CUDA
 	int				use_cuda;
 	int				cuda_device_id;

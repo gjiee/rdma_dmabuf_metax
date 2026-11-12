@@ -554,6 +554,9 @@ static void usage(const char *argv0, VerbType verb, TestType tst, int connection
 		printf("      --tclass=<value> ");
 		printf(" Set the Traffic Class in GRH (if GRH is in use)\n");
 
+		printf("      --use_metax=<gpu device id>");
+		printf(" Use MetaX GPU memory through DMA-BUF registration\n");
+
 		#ifdef HAVE_CUDA
 		printf("      --use_cuda=<cuda device id>");
 		printf(" Use CUDA specific device for GPUDirect RDMA testing\n");
@@ -756,6 +759,8 @@ static void init_perftest_params(struct perftest_parameters *user_param)
 	user_param->limit_msgrate	= 0;
 	user_param->pkey_index		= 0;
 	user_param->raw_qos		= 0;
+	user_param->use_metax		= 0;
+	user_param->metax_device_id	= 0;
 	user_param->inline_recv_size	= 0;
 	user_param->tcp			= 0;
 	user_param->burst_size		= 0;
@@ -1728,7 +1733,27 @@ static void force_dependecies(struct perftest_parameters *user_param)
 		user_param->margin = user_param->duration / 4;
 	}
 
+	if (user_param->use_metax) {
+		if (user_param->mmap_file != NULL || user_param->use_hugepages ||
+		    user_param->use_odp) {
+			printf(RESULT_LINE);
+			fprintf(stderr,
+				"MetaX memory cannot be combined with mmap, hugepages, or ODP\n");
+			exit(1);
+		}
+		if (user_param->connection_type == RawEth) {
+			printf(RESULT_LINE);
+			fprintf(stderr, "MetaX memory is not supported for Raw Ethernet tests\n");
+			exit(1);
+		}
+	}
+
 	#ifdef HAVE_CUDA
+	if (user_param->use_metax && user_param->use_cuda) {
+		printf(RESULT_LINE);
+		fprintf(stderr, "MetaX and CUDA memory modes are mutually exclusive\n");
+		exit(1);
+	}
 	if (user_param->use_cuda) {
 		if (user_param->tst != BW) {
 			printf(RESULT_LINE);
@@ -1745,6 +1770,11 @@ static void force_dependecies(struct perftest_parameters *user_param)
 	#endif
 
 	#ifdef HAVE_ROCM
+	if (user_param->use_metax && user_param->use_rocm) {
+		printf(RESULT_LINE);
+		fprintf(stderr, "MetaX and ROCm memory modes are mutually exclusive\n");
+		exit(1);
+	}
 	if (user_param->use_rocm && user_param->mmap_file != NULL) {
 		printf(RESULT_LINE);
 		fprintf(stderr,"You cannot use ROCM and an mmap'd file at the same time\n");
@@ -2089,6 +2119,15 @@ static void ctx_set_max_inline(struct ibv_context *context,struct perftest_param
 {
 	enum ctx_device current_dev = ib_dev_name(context);
 
+	/* Inline sends make the CPU read the SGE.  That is invalid for a device
+	 * pointer and would also stop WRITE latency from measuring D2R traffic. */
+	if (user_param->use_metax) {
+		if (user_param->inline_size > 0)
+			fprintf(stderr, "MetaX memory disables inline sends\n");
+		user_param->inline_size = 0;
+		return;
+	}
+
 	if (current_dev == UNKNOWN || current_dev == DEVICE_ERROR) {
 
 		if (user_param->inline_size != DEF_INLINE) {
@@ -2208,6 +2247,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 	static int flow_label_flag = 0;
 	static int retry_count_flag = 0;
 	static int dont_xchg_versions_flag = 0;
+	static int use_metax_flag = 0;
 #ifdef HAVE_CUDA
 	static int use_cuda_flag = 0;
 	static int use_cuda_bus_id_flag = 0;
@@ -2367,6 +2407,7 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
 			{ .name = "flow_label",		.has_arg = 1, .flag = &flow_label_flag, .val = 1},
 			{ .name = "retry_count",	.has_arg = 1, .flag = &retry_count_flag, .val = 1},
 			{ .name = "dont_xchg_versions",	.has_arg = 0, .flag = &dont_xchg_versions_flag, .val = 1},
+			{ .name = "use_metax",		.has_arg = 1, .flag = &use_metax_flag, .val = 1},
 			#ifdef HAVE_CUDA
 			{ .name = "use_cuda",		.has_arg = 1, .flag = &use_cuda_flag, .val = 1},
 			{ .name = "use_cuda_bus_id",	.has_arg = 1, .flag = &use_cuda_bus_id_flag, .val = 1},
@@ -2678,6 +2719,16 @@ int parser(struct perftest_parameters *user_param,char *argv[], int argc)
                                         congest_type_flag = 0;
                                 }
                                 #endif
+				if (use_metax_flag) {
+					user_param->use_metax = 1;
+					user_param->metax_device_id = strtol(optarg, NULL, 0);
+					if (user_param->metax_device_id < 0) {
+						fprintf(stderr, "Invalid MetaX device %d\n",
+							user_param->metax_device_id);
+						return FAILURE;
+					}
+					use_metax_flag = 0;
+				}
 				if (pkey_flag) {
 					user_param->pkey_index = strtol(optarg,NULL,0);
 					pkey_flag = 0;
@@ -3373,6 +3424,10 @@ void ctx_print_test_info(struct perftest_parameters *user_param)
 	#endif
 
 	printf(" ibv_wr* API     : %s\n", user_param->use_old_post_send ? "OFF" : "ON");
+	printf(" MetaX memory   : %s", user_param->use_metax ? "ON" : "OFF");
+	if (user_param->use_metax)
+		printf(" (device %d)", user_param->metax_device_id);
+	printf("\n");
 	if (user_param->machine == CLIENT || user_param->duplex) {
 		printf(" TX depth        : %d\n",user_param->tx_depth);
 	}
